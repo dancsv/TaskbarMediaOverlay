@@ -28,6 +28,7 @@ import winreg
 from io import BytesIO
 
 import tkinter as tk
+import comtypes.client
 import win32api
 import win32con
 import win32gui
@@ -61,7 +62,8 @@ FONTS_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 
 POSITION_CENTER = "center"
 POSITION_RIGHT = "right"
-TRAY_ICONS_WIDTH = 160  # space to leave clear for the system tray icons
+TRAY_GAP = 8  # padding between the widget and the tray icons
+TRAY_ICONS_WIDTH = 160  # fallback guess, used only when there's no tray to measure
 
 MEDIA_SOURCE_SPOTIFY_ONLY = "spotify_only"
 MEDIA_SOURCE_SPOTIFY_AND_BROWSERS = "spotify_and_browsers"
@@ -200,7 +202,7 @@ def get_monitors():
 
 
 def get_taskbar_rects():
-    """Returns {monitor_device: (left, top, right, bottom)} for every
+    """Returns {monitor_device: (left, top, right, bottom, hwnd)} for every
     monitor that currently has a taskbar on it."""
     rects = {}
 
@@ -210,11 +212,57 @@ def get_taskbar_rects():
             return True
         hmonitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
         device = win32api.GetMonitorInfo(hmonitor)["Device"]
-        rects[device] = win32gui.GetWindowRect(hwnd)
+        rects[device] = (*win32gui.GetWindowRect(hwnd), hwnd)
         return True
 
     win32gui.EnumWindows(callback, None)
     return rects
+
+
+def get_tray_notify_left(taskbar_hwnd):
+    """Left edge of the taskbar's notification area (tray icons + clock),
+    or None if this taskbar doesn't have one (only the primary taskbar
+    does)."""
+    tray_notify = win32gui.FindWindowEx(taskbar_hwnd, None, "TrayNotifyWnd", None)
+    if not tray_notify:
+        return None
+    return win32gui.GetWindowRect(tray_notify)[0]
+
+
+_uia = None
+
+
+def get_tray_left_edge(taskbar_hwnd):
+    """Left edge of everything clustered at the tray corner: the
+    notification icons/clock, plus the Windows 11 Widgets/weather button
+    if present. That button isn't a plain window (the modern taskbar
+    renders it through a single composition surface), so UI Automation is
+    the only way to find it - falls back to just the notification area if
+    UI Automation isn't available."""
+    global _uia
+    edges = []
+    tray_left = get_tray_notify_left(taskbar_hwnd)
+    if tray_left is not None:
+        edges.append(tray_left)
+
+    try:
+        if _uia is None:
+            comtypes.client.GetModule("UIAutomationCore.dll")
+            from comtypes.gen import UIAutomationClient as uia_mod
+
+            _uia = (comtypes.client.CreateObject(uia_mod.CUIAutomation, interface=uia_mod.IUIAutomation), uia_mod)
+        uia, uia_mod = _uia
+        elem = uia.ElementFromHandle(taskbar_hwnd)
+        condition = uia.CreatePropertyCondition(uia_mod.UIA_AutomationIdPropertyId, "WidgetsButton")
+        found = elem.FindFirst(uia_mod.TreeScope_Descendants, condition)
+        if found is not None:
+            rect = found.CurrentBoundingRectangle
+            if rect.right > rect.left:
+                edges.append(rect.left)
+    except Exception:
+        pass
+
+    return min(edges) if edges else None
 
 
 # These window classes cover a whole monitor without being a fullscreen app.
@@ -631,11 +679,13 @@ class OverlayApp:
     def _compute_geometry(self, monitor, taskbar_rect):
         width = WIDTH
         if taskbar_rect:
-            t_left, t_top, t_right, t_bottom = taskbar_rect
+            t_left, t_top, t_right, t_bottom, taskbar_hwnd = taskbar_rect
             height = max(t_bottom - t_top - 4, 30)
             y = t_top + (t_bottom - t_top - height) // 2
             if self.state.get("position_mode") == POSITION_RIGHT:
-                x = max(t_right - TRAY_ICONS_WIDTH - width, t_left)
+                tray_left = get_tray_left_edge(taskbar_hwnd)
+                edge = tray_left if tray_left is not None else t_right - TRAY_ICONS_WIDTH
+                x = max(edge - TRAY_GAP - width, t_left)
             else:
                 x = (t_left + t_right) // 2 - width // 2
         else:
