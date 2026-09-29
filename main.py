@@ -17,6 +17,7 @@ intercept mouse clicks.
 
 import asyncio
 import ctypes
+import functools
 import json
 import os
 import subprocess
@@ -76,28 +77,21 @@ BROWSER_APP_IDS = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "oper
 # instead, and this is what we match that name against.
 BROWSER_NAME_HINTS = ("firefox", "chrome", "edge", "brave", "opera", "vivaldi")
 
-_friendly_name_cache = {}
-
-
+@functools.cache
 def resolve_friendly_name(app_id):
     """Looks up the human-readable app name Windows shows in the Start
     Menu for an app id, using the same lookup Get-StartApps uses. Cached
-    since it spawns a PowerShell process and is a bit slow."""
-    if app_id in _friendly_name_cache:
-        return _friendly_name_cache[app_id]
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"(Get-StartApps | Where-Object {{$_.AppID -eq '{app_id}'}}).Name"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        name = result.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
-        return None  # don't cache a failure - it might just be transient
-    _friendly_name_cache[app_id] = name
-    return name
+    since it spawns a PowerShell process and is a bit slow - a failure
+    raises instead of returning None, so functools.cache won't remember
+    it as permanent (callers already run inside a try/except)."""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", f"(Get-StartApps | Where-Object {{$_.AppID -eq '{app_id}'}}).Name"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return result.stdout.strip() or None
 
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TaskbarMediaOverlay")
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
@@ -155,9 +149,9 @@ def persist_settings(state):
     save_settings(
         {
             "selected_monitors": sorted(state.get_selected_monitors()),
-            "hide_on_fullscreen": state.get_hide_on_fullscreen(),
-            "position_mode": state.get_position_mode(),
-            "media_source_mode": state.get_media_source_mode(),
+            "hide_on_fullscreen": state.get("hide_on_fullscreen"),
+            "position_mode": state.get("position_mode"),
+            "media_source_mode": state.get("media_source_mode"),
         }
     )
 
@@ -330,29 +324,13 @@ class NowPlaying:
         with self._lock:
             return set(self._selected_monitors)
 
-    def set_hide_on_fullscreen(self, value):
+    def get(self, name):
         with self._lock:
-            self._hide_on_fullscreen = value
+            return getattr(self, "_" + name)
 
-    def get_hide_on_fullscreen(self):
+    def set(self, name, value):
         with self._lock:
-            return self._hide_on_fullscreen
-
-    def set_position_mode(self, mode):
-        with self._lock:
-            self._position_mode = mode
-
-    def get_position_mode(self):
-        with self._lock:
-            return self._position_mode
-
-    def set_media_source_mode(self, mode):
-        with self._lock:
-            self._media_source_mode = mode
-
-    def get_media_source_mode(self):
-        with self._lock:
-            return self._media_source_mode
+            setattr(self, "_" + name, value)
 
 
 async def read_thumbnail(thumb_ref):
@@ -423,7 +401,7 @@ async def poll_loop(state, stop_event):
 
     while not stop_event.is_set():
         try:
-            session = await pick_session(manager, state.get_media_source_mode())
+            session = await pick_session(manager, state.get("media_source_mode"))
             if session is None:
                 last_title = last_artist = last_thumbnail = None
                 last_app_id = last_friendly_name = None
@@ -519,8 +497,7 @@ class MonitorOverlay:
     """One widget (art + title + artist + progress bar) anchored to one
     monitor's taskbar."""
 
-    def __init__(self, master, device, x, y, width, height, art_size):
-        self.device = device
+    def __init__(self, master, x, y, width, height, art_size):
         self.x, self.y = x, y
         self.width, self.height = width, height
         self.art_size = art_size
@@ -647,7 +624,7 @@ class OverlayApp:
                     overlay.window.move(x, y)
                     overlay.x, overlay.y = x, y
             else:
-                self.overlays[device] = MonitorOverlay(self.root, device, x, y, width, height, art_size)
+                self.overlays[device] = MonitorOverlay(self.root, x, y, width, height, art_size)
 
         return monitors
 
@@ -657,7 +634,7 @@ class OverlayApp:
             t_left, t_top, t_right, t_bottom = taskbar_rect
             height = max(t_bottom - t_top - 4, 30)
             y = t_top + (t_bottom - t_top - height) // 2
-            if self.state.get_position_mode() == POSITION_RIGHT:
+            if self.state.get("position_mode") == POSITION_RIGHT:
                 x = max(t_right - TRAY_ICONS_WIDTH - width, t_left)
             else:
                 x = (t_left + t_right) // 2 - width // 2
@@ -696,9 +673,9 @@ class OverlayApp:
 
         try:
             monitors = self._sync_monitors()
-            hide_on_fullscreen = self.state.get_hide_on_fullscreen()
+            hide_on_fullscreen = self.state.get("hide_on_fullscreen")
             title, artist, app_id, friendly_name, playing, thumbnail, position, duration = self.state.snapshot()
-            source_matches = media_source_matches(app_id, friendly_name, self.state.get_media_source_mode())
+            source_matches = media_source_matches(app_id, friendly_name, self.state.get("media_source_mode"))
 
             now = time.monotonic()
             if source_matches and title and playing:
@@ -757,19 +734,19 @@ def build_tray_icon(state, app):
         return handler
 
     def toggle_hide_on_fullscreen(icon, item):
-        state.set_hide_on_fullscreen(not state.get_hide_on_fullscreen())
+        state.set("hide_on_fullscreen", not state.get("hide_on_fullscreen"))
         persist_settings(state)
 
     def set_position_mode(mode):
         def handler(icon, item):
-            state.set_position_mode(mode)
+            state.set("position_mode", mode)
             persist_settings(state)
 
         return handler
 
     def set_media_source_mode(mode):
         def handler(icon, item):
-            state.set_media_source_mode(mode)
+            state.set("media_source_mode", mode)
             persist_settings(state)
 
         return handler
@@ -801,7 +778,7 @@ def build_tray_icon(state, app):
         pystray.MenuItem(
             "Hide on Fullscreen Monitors",
             toggle_hide_on_fullscreen,
-            checked=lambda item: state.get_hide_on_fullscreen(),
+            checked=lambda item: state.get("hide_on_fullscreen"),
         )
     )
 
@@ -809,13 +786,13 @@ def build_tray_icon(state, app):
         pystray.MenuItem(
             "Centered",
             set_position_mode(POSITION_CENTER),
-            checked=lambda item: state.get_position_mode() == POSITION_CENTER,
+            checked=lambda item: state.get("position_mode") == POSITION_CENTER,
             radio=True,
         ),
         pystray.MenuItem(
             "Right Side",
             set_position_mode(POSITION_RIGHT),
-            checked=lambda item: state.get_position_mode() == POSITION_RIGHT,
+            checked=lambda item: state.get("position_mode") == POSITION_RIGHT,
             radio=True,
         ),
     )
@@ -826,10 +803,10 @@ def build_tray_icon(state, app):
             pystray.MenuItem(
                 MEDIA_SOURCE_LABELS[mode],
                 set_media_source_mode(mode),
-                checked=lambda item, m=mode: state.get_media_source_mode() == m,
+                checked=lambda item, m=mode: state.get("media_source_mode") == m,
                 radio=True,
             )
-            for mode in (MEDIA_SOURCE_SPOTIFY_AND_BROWSERS, MEDIA_SOURCE_SPOTIFY_ONLY, MEDIA_SOURCE_ALL)
+            for mode in MEDIA_SOURCE_LABELS
         )
     )
     menu_items.append(pystray.MenuItem("Media Source", media_source_menu))
@@ -864,11 +841,11 @@ def main():
             state.set_monitor_selected(primary["device"], True)
 
     if "hide_on_fullscreen" in saved:
-        state.set_hide_on_fullscreen(saved["hide_on_fullscreen"])
+        state.set("hide_on_fullscreen", saved["hide_on_fullscreen"])
     if saved.get("position_mode") in (POSITION_CENTER, POSITION_RIGHT):
-        state.set_position_mode(saved["position_mode"])
+        state.set("position_mode", saved["position_mode"])
     if saved.get("media_source_mode") in MEDIA_SOURCE_LABELS:
-        state.set_media_source_mode(saved["media_source_mode"])
+        state.set("media_source_mode", saved["media_source_mode"])
 
     stop_event = threading.Event()
     start_background_loop(state, stop_event)
