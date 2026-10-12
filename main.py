@@ -462,8 +462,9 @@ async def poll_loop(state, stop_event):
                 artist = info.artist or ""
                 app_id = session.source_app_user_model_id or ""
 
-                # Only re-fetch the thumbnail when the track actually changed.
-                if title != last_title or artist != last_artist:
+                # Re-fetch the thumbnail when the track changed, or while we
+                # still have none (art can show up after the metadata does).
+                if title != last_title or artist != last_artist or last_thumbnail is None:
                     last_thumbnail = await read_thumbnail(info.thumbnail)
                     last_title, last_artist = title, artist
 
@@ -558,7 +559,7 @@ class MonitorOverlay:
         self.text_x = PAD + art_size + PAD
         self.text_width = max(width - self.text_x - PAD, 40)
 
-        self._current_art_bytes = None
+        self._current_art_bytes = False  # distinct from None, so the first load always runs
         self._art_image = None
         self._art_mask = None
         self._current_title = None
@@ -572,17 +573,16 @@ class MonitorOverlay:
         if data == self._current_art_bytes:
             return
         self._current_art_bytes = data
-        if not data:
-            self._art_image = None
-            self._art_mask = None
-            return
-        try:
-            img = Image.open(BytesIO(data)).convert("RGB")
-            self._art_image = img.resize((self.art_size, self.art_size), Image.LANCZOS)
-            self._art_mask = rounded_mask(self._art_image.size, ART_CORNER_RADIUS)
-        except (OSError, TypeError):
-            self._art_image = None
-            self._art_mask = None
+        # Plain gray square when there's no art, so the layout doesn't
+        # show an empty gap.
+        img = Image.new("RGB", (self.art_size, self.art_size), PROGRESS_BG)
+        if data:
+            try:
+                img = Image.open(BytesIO(data)).convert("RGB").resize((self.art_size, self.art_size), Image.LANCZOS)
+            except (OSError, TypeError):
+                pass
+        self._art_image = img
+        self._art_mask = rounded_mask(img.size, ART_CORNER_RADIUS)
 
     def render(self, title, artist, fraction, has_progress):
         self._current_title = title
